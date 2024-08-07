@@ -8,3 +8,4 @@ from . import flir
 from . import national_instruments
 from . import serial_communication
 from . import simulator
+from . import micro_epsilon
