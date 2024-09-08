@@ -1,1 +1,1 @@
-from .acquisition import MELaserScanner
+from .acquisition import MELaserScanner, MELaserScanner2
