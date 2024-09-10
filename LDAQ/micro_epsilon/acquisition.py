@@ -130,8 +130,10 @@ class Scanner:
         self.is_on = True
         self._connect_scanner()
         self._setup_laser()
-        self.update_event = None
+        self.update_event = threading.Event()
         self._termination_flag = False
+        self.llt = llt
+        self.data_buffer = []
 
 
     def _initialize_scanner(self):
@@ -280,6 +282,8 @@ class Scanner:
         # self.scanner_buffer = Buffer(self.resolution, self.data_width)
         self._pointers = {}
         self._buffer_arrays = {}
+        # moramo si shranit, ker rabimo v _read_data_loop-u
+        self._channel_names = channel_names
 
         for name, data_type in self._default_channel_names.items():
             if name in channel_names:
@@ -347,25 +351,37 @@ class MELaserScanner(BaseAcquisition):
         else:
             self.acquisition_name = acquisition_name
         
+        self.device = device
+            
         if channel_names is None:
-            self._channel_names_init = ["X", "Z", "I", "T", "W", "M0", "M1"]
+            self._channel_names = ["X", "Z", "I", "T", "W", "M0", "M1"]
         else:
             #TODO check for correct channel names?
-            self._channel_names_init = channel_names
+            self._channel_names = channel_names
 
-        self.channel_idx = [i for i in range(len(self._channel_names_init))]
+        self._channel_names_init = [
+                f"{name}_{i}" for name in self._channel_names for i in range(
+                self.device.resolution)
+            ]
 
-        self.device = device
-        self.sample_rate = self.device.sample_rate
-        self.device.profile_setup(self._channel_names_init)
+        # self._channel_names_init = ["all"]
+        # self._spacer = self.device.resolution * len(self._channel_names)
+        # self._channel_names_video_init = self._channel_names
+        # self._channel_shapes_video_init = [[640,1] for i in range(len(self._channel_names))]
+
+        self.channel_idx = [i for i in range(len(self._channel_names))]
+
+        self.sample_rate = self.device.sample_rate#s*self._spacer
+        self._timeout_time = 1/self.device.sample_rate*2
+        self.device.profile_setup(self._channel_names)
 
         self.set_trigger(1e20, 0, duration=1.0)
 
-        self.set_data_source()
+        # self.set_data_source()
 
 
     def terminate_data_source(self) -> None:
-        """        
+        """
         Properly closes acquisition source after the measurement.
         
         Returns None.
@@ -374,7 +390,7 @@ class MELaserScanner(BaseAcquisition):
 
         self.acq_thread.join()
 
-        self.device._stop_transfer()
+        # self.device._stop_transfer()
 
 
     def get_sample_rate(self):
@@ -392,6 +408,7 @@ class MELaserScanner(BaseAcquisition):
         """
         setup the data source and start the profile transfer.
         """
+        self.clear_buffer()
 
         self.acq_thread = threading.Thread(
             target = _read_data_loop, args = [self.device]
@@ -406,15 +423,37 @@ class MELaserScanner(BaseAcquisition):
         Read data from the scanner.
         """
         while True:
-            self.device.update_event.wait()
+            
+            # vrne False, ce se izvede timeout
+            _flag = self.device.update_event.wait(self._timeout_time)
+
             data = np.array(
-                [self.device._buffer_arrays[name] for name in self._channel_names_init]
-            ).T
+                self.device.data_buffer
+                ).T
+            print(data.shape)
+            if len(data.shape) < 1:
+                data.reshape(-1, 1)
+                print("Only 1")
+            if not _flag:
+                data = np.zeros(self.device.resolution*len(self._channel_names)
+                                ).reshape(-1,1)
+                print("Added an empty profile, proceed with caution")
+            
+            self.clear_buffer()
             break
 
         self.device.update_event.clear()
 
         return data
+    
+    
+    def clear_buffer(self) -> None:
+        """
+        clear the device buffer list
+        """
+
+        self.device.data_buffer = []
+
 
 
 def _data_generator(device: Scanner, buffer: Buffer):
@@ -462,6 +501,8 @@ def _read_data_loop(device: Scanner):
         )
     if ret < 1:
         raise Exception(f"Error setting callback: {ret}")
+    
+    time.sleep(0.1)
     ret = llt.transfer_profiles(device.hLLT, 
                                 llt.TTransferProfileType.NORMAL_TRANSFER, 1)
     if ret < 1:
@@ -469,13 +510,26 @@ def _read_data_loop(device: Scanner):
 
     time.sleep(0.1)
 
-    device.update_event = threading.Event()
+    # device.update_event = threading.Event()
     gen_fun = _data_generator(device, buffer)
 
+    i = 0
     while True:
         if device._termination_flag:
+            device._stop_transfer()
+            time.sleep(0.1)
             gen_fun.close()
             break
-
+        
         next(gen_fun)
+
+        data = np.array(
+                [device._buffer_arrays[name] for name in device._channel_names]
+            ).T.flatten()
+        
+        device.data_buffer.append(data)
+        # print(i, device._buffer_arrays["Z"][100])
         device.update_event.set()
+
+        i += 1
+
